@@ -28,6 +28,22 @@ STATE_CANCELED, STATE_REJECTED = "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
 TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
 ROLE_USER, ROLE_AGENT = "ROLE_USER", "ROLE_AGENT"
 
+
+def wire_state(state: str) -> str:
+    """Normalize Hermes task states for strict v0.3-style A2A clients."""
+    value = (state or "").strip()
+    if value.startswith("TASK_STATE_"):
+        value = value[len("TASK_STATE_"):]
+    return value.replace("_", "-").lower()
+
+
+def wire_role(role: str) -> str:
+    """Normalize Hermes message roles for strict v0.3-style A2A clients."""
+    value = (role or "").strip()
+    if value.startswith("ROLE_"):
+        value = value[len("ROLE_"):]
+    return value.lower()
+
 # A reply starting with this marker is a clarification request -> TASK_STATE_INPUT_REQUIRED (marker stripped).
 INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
 
@@ -128,13 +144,13 @@ def new_context_id() -> str:
 
 
 def text_part(text: str) -> dict:
-    """v1.0 text Part (member-presence discriminated, no ``kind``)."""
-    return {"text": text, "mediaType": "text/plain"}
+    """Text Part compatible with strict FastA2A discriminated unions."""
+    return {"kind": "text", "text": text, "mimeType": "text/plain"}
 
 
 def text_message(role: str, text: str, context_id: str = "") -> dict:
     """A2A v1.0 Message with a single text Part."""
-    msg: dict[str, Any] = {"role": role, "parts": [text_part(text)], "messageId": uuid.uuid4().hex}
+    msg: dict[str, Any] = {"kind": "message", "role": wire_role(role), "parts": [text_part(text)], "messageId": uuid.uuid4().hex}
     if context_id:
         msg["contextId"] = context_id
     return msg
@@ -185,7 +201,7 @@ def extract_context_id(params: dict) -> str:
 def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
     createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
-    task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": now_iso()}}
+    task: dict[str, Any] = {"kind": "task", "id": task_id, "contextId": context_id, "status": {"state": wire_state(state), "timestamp": now_iso()}}
     if agent_text:
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
@@ -195,7 +211,7 @@ def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", 
 
 def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
     """v1.0 StreamResponse with a statusUpdate member."""
-    status: dict[str, Any] = {"state": state, "timestamp": now_iso()}
+    status: dict[str, Any] = {"state": wire_state(state), "timestamp": now_iso()}
     if text:
         status["message"] = text_message(ROLE_AGENT, text, context_id)
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
