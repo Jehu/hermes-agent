@@ -83,7 +83,12 @@ def test_manager_fans_out_to_all_providers():
         assert call["new"] == "new-sid"
         assert call["parent"] == "old-sid"
         assert call["reset"] is False
-        assert call["extra"] == {"reason": "resume"}
+        assert call["extra"] == {
+            "reason": "resume",
+            "cwd": None,
+            "session_title": None,
+            "session_title_source": None,
+        }
 
 
 def test_manager_isolates_provider_failures():
