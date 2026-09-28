@@ -114,10 +114,8 @@ def jsonrpc_error(req_id: Any, code: int, message: str) -> dict:
 
 
 def send_message_response(payload: dict) -> dict:
-    """v1.0 SendMessageResponse oneof: exactly one of ``task`` / ``message``."""
-    if isinstance(payload, dict) and payload.get("status") and payload.get("id"):
-        return {"task": payload}
-    return {"message": payload}
+    """Return the bare Task or Message required by FastA2A 0.5's JSON-RPC result."""
+    return payload
 
 
 def unwrap_send_message_response(result: Any) -> Any:
