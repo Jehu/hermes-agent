@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { currentPickerSelection, displayModelName, formatModelPillLabel, modelDisplayParts, modelRouteTags, providerDisplayName } from './model-status-label'
-import { reasoningEffortLabel } from './reasoning-effort'
+import {
+  currentPickerSelection,
+  displayModelName,
+  formatModelPillLabel,
+  modelDisplayParts,
+  modelRouteTags
+} from './model-status-label'
 
 describe('model-status-label', () => {
   it('strips trailing date-pin snapshots and dots hyphenated Anthropic versions', () => {

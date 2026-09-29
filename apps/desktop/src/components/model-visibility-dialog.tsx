@@ -187,9 +187,7 @@ export function ModelVisibilityDialog({
                           <span className="min-w-0 flex-1 truncate">
                             <HighlightMatches foldSeparators query={search} text={name} />
                             {tag ? <span className="text-(--ui-text-tertiary)"> {tag}</span> : null}
-                            {routeTag ? (
-                              <span className="text-(--ui-text-tertiary)"> · {routeTag}</span>
-                            ) : null}
+                            {routeTag ? <span className="text-(--ui-text-tertiary)"> · {routeTag}</span> : null}
                           </span>
                           {isCustomModel(customModels, provider.slug, family.id) && (
                             <Button

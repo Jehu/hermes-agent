@@ -158,6 +158,7 @@ describe('the catalog owns model curation', () => {
     const triggers = await screen.findAllByText(
       (_, element) => element?.textContent?.startsWith('Opus 4.8 · anthropic') ?? false
     )
+
     const trigger = triggers.find(element => element.getAttribute('data-slot') === 'tooltip-trigger')!
 
     expect(trigger.getAttribute('title')).toBeNull()
