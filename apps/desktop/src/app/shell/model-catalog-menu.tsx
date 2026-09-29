@@ -631,9 +631,7 @@ export function ModelCatalogMenu({
                           >
                             <span className="min-w-0 flex-1 truncate">
                               <HighlightMatches foldSeparators query={search} text={name} />
-                              {routeTag ? (
-                                <span className="text-(--ui-text-tertiary)"> · {routeTag}</span>
-                              ) : null}
+                              {routeTag ? <span className="text-(--ui-text-tertiary)"> · {routeTag}</span> : null}
                               {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
                             </span>
                             {loadProgress ? (

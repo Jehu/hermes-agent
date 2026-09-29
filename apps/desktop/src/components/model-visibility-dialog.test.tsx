@@ -47,11 +47,7 @@ describe('ModelVisibilityDialog', () => {
     render(
       <QueryClientProvider client={client}>
         <I18nProvider>
-          <ModelVisibilityDialog
-            onOpenChange={() => undefined}
-            onOpenProviders={() => undefined}
-            open
-          />
+          <ModelVisibilityDialog onOpenChange={() => undefined} onOpenProviders={() => undefined} open />
         </I18nProvider>
       </QueryClientProvider>
     )
