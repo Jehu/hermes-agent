@@ -66,6 +66,18 @@ def cli_instance(tmp_path, session_db):
 class TestBranchCommandCLI:
     """Test the /branch command logic for the CLI."""
 
+    def test_branch_creates_new_session(self, cli_instance, session_db):
+        """Branching should create a new session in the DB."""
+        from cli import HermesCLI
+
+        # Call the real method on the mock, using the real implementation
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        # Verify a new session was created
+        assert cli_instance.session_id != "20260403_120000_abc123"
+        new_session = session_db.get_session(cli_instance.session_id)
+        assert new_session is not None
+        assert session_db.get_session_title_source(cli_instance.session_id) == session_db.TITLE_SOURCE_DERIVED
 
     def test_failed_branch_creation_leaves_original_session_open(self, cli_instance, session_db):
         """Branching is child-first: when create_session fails the user stays on the original
@@ -100,6 +112,7 @@ class TestBranchCommandCLI:
 
         title = session_db.get_session_title(cli_instance.session_id)
         assert title == "refactor approach"
+        assert session_db.get_session_title_source(cli_instance.session_id) == session_db.TITLE_SOURCE_USER
 
 
 

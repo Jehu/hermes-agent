@@ -191,7 +191,7 @@ def a2a_call(args: dict, **_: Any) -> str:
     short_state = state.replace("TASK_STATE_", "").replace("_", "-").lower()  # v0.3 states pass through
     header = f"[{agent} · context {reply_ctx}" + (f" · {short_state}" if state else "") + "]"
     body = reply or "(no text reply)"
-    if state == protocol.STATE_INPUT_REQUIRED:
+    if short_state == "input-required":
         body += f"\n\n(The peer needs more input — answer by calling a2a_call again with context_id '{reply_ctx}'.)"
     return f"{header}\n{body}"
 

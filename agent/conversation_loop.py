@@ -667,12 +667,8 @@ def _bot_chat_prompt_stale(agent, stored_prompt: str | None) -> bool:
             return True
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
-        title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-        if not title and agent._session_db and agent.session_id:
-            try:
-                title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
-            except Exception:
-                title = ""
+        from agent.session_title import current_session_title
+        title = current_session_title(agent)
         return title == BOT_CHAT_TITLE and bool(stored_bot_chat_prompt_needs_upgrade(stored_prompt, home))
     except Exception:
         return False

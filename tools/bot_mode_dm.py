@@ -872,14 +872,8 @@ def _agent_home(agent: Any) -> str:
 
 
 def _session_title(agent: Any) -> str:
-    title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-    if title:
-        return title
-    with contextlib.suppress(Exception):
-        sdb, sid = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
-        if sdb and sid:
-            return str(sdb.get_session_title(sid) or "").strip()
-    return ""
+    from agent.session_title import current_session_title
+    return current_session_title(agent)
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a background process

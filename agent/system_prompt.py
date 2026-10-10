@@ -348,11 +348,8 @@ def _bot_mode_parts(agent: Any) -> List[str]:
     parts: List[str] = []
     try:
         from tools.bot_mode_probe import BOT_CHAT_TITLE, epoch_line, get_bot_mode_protocol_section
-        _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
-        if not _title:
-            _sdb = getattr(agent, "_session_db", None)
-            _sid = getattr(agent, "session_id", None)
-            _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
+        from agent.session_title import current_session_title
+        _title = current_session_title(agent)
         _bot_section = get_bot_mode_protocol_section(_agent_home(agent)) if _title == BOT_CHAT_TITLE else None
         if _bot_section:
             parts.append(_bot_section)
@@ -602,7 +599,7 @@ def _workspace_pin_key() -> str:
     directory``: a build with no cwd bound (launch dir) and a later one binding that same dir
     (TUI ``/compress``) are one workspace, not two."""
     try:
-        return str(resolve_context_cwd() or resolve_agent_cwd())
+        return str(Path(resolve_context_cwd() or resolve_agent_cwd()).resolve())
     except OSError:  # deleted cwd
         return ""
 
@@ -652,7 +649,7 @@ def _seed_workspace_pin(agent: Any, key: str) -> None:
     if not prompt:
         return
     stored_cwd = runtime_host_value(prompt, "Current working directory")
-    if stored_cwd and stored_cwd != key:
+    if stored_cwd and Path(stored_cwd).resolve() != Path(key).resolve():
         return
     block = _persisted_workspace_block(prompt, key)
     # Only a real snapshot is adopted: a prompt without one (built on a surface without the

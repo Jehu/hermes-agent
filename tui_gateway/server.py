@@ -1025,13 +1025,50 @@ def _release_build_profile_scopes(scopes: "_TurnScopes | None") -> None:
         _release_profile_runtime_scope_tokens(scopes)
 
 
+def _claim_pending_title_context(current: dict, session_db) -> tuple[str | None, str | None]:
+    """Claim a pending user title through SessionDB before exposing it to providers."""
+    pending = current.get("pending_title")
+    if not pending:
+        return None, None
+    try:
+        if _ensure_session_db_row(current) is False:
+            return None, None
+    except Exception:
+        return None, None
+    db = session_db if session_db is not None else _get_db()
+    if db is None:
+        return None, None
+    key = current.get("session_key") or ""
+    try:
+        changed = db.set_session_title(key, pending)
+        stored = db.get_session_title(key)
+        if changed:
+            current["pending_title"] = None
+            return stored, "user" if stored else None
+        if stored and stored == db.sanitize_title(pending):
+            current["pending_title"] = None
+            return stored, "user"
+    except ValueError:
+        current["pending_title"] = None
+    except Exception:
+        pass
+    return None, None
+
+
 def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     """_make_agent kwargs for a deferred (first-prompt) build. A lazy-resumed (watch) session carries the
     stored conversation id so the upgrade continues it; a cold deferred resume restores the full persisted
     runtime identity (like the eager resume's overrides splat) so the build can't drop the provider. No
     stored runtime, or an unroutable provider → this session's picked model/effort/tier, else the default."""
-    kw = {"session_db": session_db, "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(current),
-          "platform_override": _session_source(current), "cwd_override": _session_cwd(current)}
+    session_title, session_title_source = _claim_pending_title_context(current, session_db)
+    kw = {
+        "session_db": session_db,
+        "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(current),
+        "platform_override": _session_source(current),
+        "cwd_override": _session_cwd(current),
+        "session_title_hint": session_title,
+        "session_title_source": session_title_source,
+    }
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
@@ -1088,9 +1125,6 @@ def _attach_built_agent(sid: str, current: dict, agent) -> bool:
     """Attach a freshly built agent to its live record (session DB row deferred to first run_conversation()).
     False when ``session.close`` popped this record mid-build: teardown saw ``agent=None`` and closed
     nothing, so the caller owns closing the orphan (#49852)."""
-    # Bot Mode gate hint: the DB title lands post-first-turn but the system prompt builds at turn START.
-    if _title_hint := str(current.get("pending_title") or "").strip():
-        agent._session_title_hint = _title_hint
     # Under the same lock session.close takes to pop the record: no window between "still live" and "attached".
     with _sessions_lock:
         if _sessions.get(sid) is not current:
@@ -1247,7 +1281,12 @@ def _sess_nowait(params, rid):
 
 def _sess(params, rid):
     s, err = _sess_building(params, rid)
-    return (None, err) if err else (s, _wait_agent(s, rid))
+    if err or s is None:
+        return None, err
+    # Unlike an attachment, this RPC needs the agent; a titled draft still builds here.
+    if s.get("pending_title"):
+        _start_agent_build(params.get("session_id") or "", s)
+    return s, _wait_agent(s, rid)
 
 
 def _sess_building(params, rid):
@@ -1255,7 +1294,9 @@ def _sess_building(params, rid):
     clipboard.paste, image.detach), which only touch creation-time fields and run inline on the socket
     reader thread, where waiting on a cold build stalled every RPC behind it ("text is instant, images hang")."""
     s, err = _sess_nowait(params, rid)
-    if not err:
+    # An attachment is still a draft: building a titled session claims its title and
+    # inserts a DB row before the user has sent anything. Let prompt.submit start it.
+    if s is not None and not err and not s.get("pending_title"):
         _start_agent_build(params.get("session_id") or "", s)
     return (None, err) if err else (s, None)
 
@@ -2658,8 +2699,9 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    cwd_override: str | None = None, auth_user_id: str | None = None):
-    # AC-4 test seam: dead unless armed by the isolated certify harness.
+    cwd_override: str | None = None, auth_user_id: str | None = None,
+    session_title_hint: str | None = None, session_title_source: str | None = None,
+):
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
@@ -2699,6 +2741,8 @@ def _make_agent(
         provider_sort=_pr.get("sort"), provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"), platform=platform, session_id=session_id or key,
         cwd=cwd_override,
+        session_title_hint=session_title_hint,
+        session_title_source=session_title_source,
         # The dashboard login identity reaches memory providers as the runtime user, like a gateway user id.
         # Builds that run before the record exists (branch, eager resume, compute host) pass it explicitly.
         user_id=auth_user_id if auth_user_id is not None else _session_auth_user_id(session),
@@ -2940,10 +2984,11 @@ def _finalize_superseded_runtimes(stale: list[tuple[str, dict]]) -> None:
 
 
 def _schedule_agent_build(sid: str, delay: float = 0.05) -> None:
-    """Pre-warm a deferred session's agent off the response path (session.create + cold resume; _sess() also builds on demand)."""
+    """Pre-warm untitled sessions off the response path; titled drafts wait for real activity so claiming
+    their pending title cannot persist an abandoned composer."""
 
     def _run():
-        if (session := _sessions.get(sid)) is not None:
+        if (session := _sessions.get(sid)) is not None and not session.get("pending_title"):
             _start_agent_build(sid, session)
     timer = threading.Timer(delay, _run)
     timer.daemon = True

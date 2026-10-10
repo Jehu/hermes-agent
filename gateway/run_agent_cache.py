@@ -838,7 +838,8 @@ class GatewayAgentCacheMixin:
         if agent is None or agent is _AGENT_PENDING_SENTINEL or id(agent) in self._running_agent_ids():
             return
         self._spawn_release_thread(
-            self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
+            self._commit_then_release_soft, (agent, session_key),
+            f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
             session_key=session_key,
         )
 
@@ -903,9 +904,20 @@ class GatewayAgentCacheMixin:
             logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
 
     def _commit_then_release_soft(self, agent: Any, key: str) -> None:
-        """Commit end-of-session memory (if warranted), then soft-release — on the daemon eviction
-        thread. Order matters: commit needs the live memory manager before ``release_clients``."""
-        self._commit_memory_before_soft_evict(agent, key)
+        """Finish provider writes before releasing an evicted agent's clients.
+
+        An evicted agent is never reused, so a provider with buffered turns needs its
+        shutdown hook; on_session_end alone may be a no-op. Keep tool state alive for
+        the resumed session via the resource-only soft release below.
+        """
+        if getattr(agent, "_memory_manager", None) is not None and hasattr(agent, "shutdown_memory_provider"):
+            try:
+                messages = getattr(agent, "_session_messages", None)
+                agent.shutdown_memory_provider(messages if isinstance(messages, list) else None)
+            except Exception as exc:
+                logger.warning("Pre-evict memory shutdown failed for %s: %s", key, exc, exc_info=True)
+        else:
+            self._commit_memory_before_soft_evict(agent, key)
         self._release_evicted_agent_soft(agent)
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:

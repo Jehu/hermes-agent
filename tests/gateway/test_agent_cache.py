@@ -314,8 +314,8 @@ class TestAgentCacheBoundedGrowth:
             m._last_activity_ts = _t.time()
         return m
 
-    def test_cap_commits_memory_before_soft_release(self, monkeypatch):
-        """LRU eviction commits the transcript before releasing clients."""
+    def test_cap_shuts_down_memory_before_soft_release(self, monkeypatch):
+        """LRU eviction drains buffered provider turns before releasing clients."""
         from gateway import run as gw_run
 
         monkeypatch.setattr(gw_run, "_AGENT_CACHE_MAX_SIZE", 1)
@@ -331,7 +331,7 @@ class TestAgentCacheBoundedGrowth:
         old_agent = self._fake_agent()
         old_agent._memory_manager = MagicMock()  # has an external provider
         old_agent._session_messages = [{"role": "user", "content": "hi"}]
-        old_agent.commit_memory_session = lambda msgs=None: commit_calls.append(msgs)
+        old_agent.shutdown_memory_provider = lambda msgs=None: commit_calls.append(msgs)
         new_agent = self._fake_agent()
 
         with runner._agent_cache_lock:

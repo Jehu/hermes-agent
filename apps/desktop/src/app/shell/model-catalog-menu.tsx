@@ -37,7 +37,7 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { isSubmitEnter } from '@/lib/ime'
 import { catalogProviderMatches, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
-import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
+import { displayModelName, modelDisplayParts, modelRouteTags } from '@/lib/model-status-label'
 import { accountResetMs, formatReset, modelResetMs } from '@/lib/provider-limit'
 import { reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { foldIncludes, normalize } from '@/lib/text'
@@ -378,6 +378,11 @@ export function ModelCatalogMenu({
         q ? null : favoriteSet
       ),
     [pickerProviders, search, current.model, current.provider, shownKeys, q, favoriteSet]
+  )
+
+  const routeTags = useMemo(
+    () => new Map(pickerProviders.map(provider => [provider.slug, modelRouteTags(provider.models ?? [])])),
+    [pickerProviders]
   )
 
   // Presets are searchable rows like everything else — an unfiltered preset
@@ -767,6 +772,7 @@ export function ModelCatalogMenu({
                     onSelect={selectFamily}
                     onSubOpenChange={handleSubOpenChange}
                     provider={provider}
+                    routeTag={routeTags.get(provider.slug)?.get(family.id)}
                     search={search}
                   />
                 </Fragment>
@@ -817,6 +823,7 @@ export function ModelCatalogMenu({
                       onSelect={selectFamily}
                       onSubOpenChange={handleSubOpenChange}
                       provider={group.provider}
+                      routeTag={routeTags.get(group.provider.slug)?.get(family.id)}
                       search={search}
                     />
                   ))}
@@ -979,6 +986,7 @@ interface ModelFamilyRowProps {
   /** Keyboard-focus round trip for the sub this row opens (#86966). */
   onSubOpenChange?: (open: boolean, key: string) => void
   provider: ModelOptionProvider
+  routeTag?: string
   search: string
 }
 
@@ -997,6 +1005,7 @@ function ModelFamilyRow({
   onSelect,
   onSubOpenChange,
   provider,
+  routeTag,
   search
 }: ModelFamilyRowProps): ReactElement {
   const { t } = useI18n()
@@ -1132,9 +1141,12 @@ function ModelFamilyRow({
         </Tip>
         <span className={cn('flex min-w-0 flex-1 items-center gap-1.5', limit.tone)}>
           {decoration.icon !== undefined ? <ModelMenuRowIcon icon={decoration.icon} /> : null}
-          <span className="min-w-0 truncate">
-            <HighlightMatches foldSeparators query={search} text={name} />
-          </span>
+          <Tip label={activeId ?? family.id}>
+            <span className="min-w-0 truncate">
+              <HighlightMatches foldSeparators query={search} text={name} />
+              {routeTag ? <span className="text-(--ui-text-tertiary)"> · {routeTag}</span> : null}
+            </span>
+          </Tip>
           {tag ? <ModelChip>{tag}</ModelChip> : null}
           {decoration.badge ? (
             <Badge className="shrink-0 uppercase tracking-wide" data-model-menu-row-badge="" size="xs" variant="muted">

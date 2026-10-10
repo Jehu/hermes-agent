@@ -83,6 +83,80 @@ class TestHandleTitleCommand:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_set_title_evicts_cached_agent(self, tmp_path):
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "telegram")
+        runner = _make_runner(session_db=db)
+        session_key = "telegram:12345:67890"
+        runner.session_store._generate_session_key.return_value = session_key
+        runner._agent_cache_lock = None
+        runner._agent_cache = {session_key: _AGENT_PENDING_SENTINEL}
+
+        await runner._handle_title_command(_make_event(text="/title Fresh title"))
+
+        assert session_key not in runner._agent_cache
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_flushes_buffered_provider_before_soft_release(self, tmp_path):
+        """An evicted agent will not get a later switch/shutdown to flush partial batches."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("test_session_123", "telegram")
+        runner = _make_runner(session_db=db)
+        key = "telegram:12345:67890"
+        runner.session_store._generate_session_key.return_value = key
+        runner._agent_cache_lock = None
+        calls = []
+
+        class BufferedManager:
+            pending = ["partial batch"]
+
+            def on_session_end(self, messages):
+                calls.append("end")  # Hindsight uses the default no-op here.
+
+            def shutdown_all(self):
+                calls.extend(self.pending)
+                self.pending.clear()
+
+        manager = BufferedManager()
+
+        class CachedAgent:
+            _memory_manager = manager
+            _session_messages = [{"role": "user", "content": "partial batch"}]
+            _memory_provider_shutdown = False
+
+            def shutdown_memory_provider(self, messages=None):
+                if self._memory_provider_shutdown:
+                    return
+                self._memory_provider_shutdown = True
+                manager.on_session_end(messages or [])
+                manager.shutdown_all()
+
+            def commit_memory_session(self, messages=None):
+                manager.on_session_end(messages or [])
+
+            def release_clients(self):
+                calls.append("release")
+
+        agent = CachedAgent()
+        runner._agent_cache = {key: (agent, "signature")}
+        # Drive the same release callback synchronously to assert its ordering, without a thread race.
+        runner._spawn_release_thread = lambda target, args, name, **kwargs: target(*args)
+
+        try:
+            await runner._handle_title_command(_make_event(text="/title Fresh title"))
+            assert key not in runner._agent_cache
+            assert calls == ["end", "partial batch", "release"]
+            assert manager.pending == []
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
     async def test_set_title_propagates_to_telegram_topic_rename(self, tmp_path):
         """/title <name> also renames the visible Telegram topic, not just the DB."""
         from hermes_state import SessionDB

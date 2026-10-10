@@ -15,6 +15,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.system_prompt import invalidate_system_prompt
 
 
@@ -141,6 +143,65 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    @pytest.mark.platforms("macos")
+    def test_workspace_snapshot_replays_when_cwd_uses_macos_alias(self):
+        """The launch spelling /var/tmp and resolved /private/var/tmp are one workspace."""
+        import shutil, subprocess, tempfile
+        from pathlib import Path
+        from agent.system_prompt import build_system_prompt, invalidate_system_prompt
+
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-alias-", dir="/var/tmp"))
+        try:
+            repo = _init_repo(tmp / "proj", "init commit")
+            canonical_repo = repo.resolve()
+            self.assertNotEqual(repo, canonical_repo)
+            agent = self._pin_agent()
+            with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                 patch("agent.prompt_builder.build_environment_hints", return_value="ENV HINTS"):
+                with patch("agent.system_prompt.resolve_context_cwd", return_value=repo):
+                    first = build_system_prompt(agent)
+                self.assertIn("Status: clean", first)
+                subprocess.run(["git", "commit", "-qm", "second commit", "--allow-empty"], cwd=repo, check=True)
+                invalidate_system_prompt(agent)
+                with patch("agent.system_prompt.resolve_context_cwd", return_value=canonical_repo):
+                    rebuilt = build_system_prompt(agent)
+                self.assertEqual(rebuilt, first)
+                self.assertNotIn("second commit", rebuilt)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @pytest.mark.platforms("macos")
+    def test_persisted_workspace_snapshot_replays_with_macos_cwd_alias(self):
+        """A resumed agent accepts the stored cwd's alias without changing snapshot bytes."""
+        import shutil, subprocess, tempfile
+        from pathlib import Path
+        from agent.system_prompt import build_system_prompt
+
+        tmp = Path(tempfile.mkdtemp(prefix="test-persisted-alias-", dir="/var/tmp"))
+        try:
+            repo = _init_repo(tmp / "proj", "init commit")
+            canonical_repo = repo.resolve()
+            self.assertNotEqual(repo, canonical_repo)
+            env = f"Host: x\nUser home directory: /h\nCurrent working directory: {repo}"
+            with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                 patch("agent.prompt_builder.build_environment_hints", return_value=env), \
+                 patch("agent.system_prompt.resolve_context_cwd", return_value=repo):
+                stored = build_system_prompt(self._pin_agent())
+            self.assertIn("Status: clean", stored)
+            subprocess.run(["git", "commit", "-qm", "second commit", "--allow-empty"], cwd=repo, check=True)
+            db = SimpleNamespace(get_session=lambda sid: {"system_prompt": stored})
+            resumed = self._pin_agent(_cached_system_prompt=None, _session_db=db)
+            with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                 patch("agent.prompt_builder.build_environment_hints", return_value=env), \
+                 patch("agent.system_prompt.resolve_context_cwd", return_value=canonical_repo):
+                rebuilt = build_system_prompt(resumed)
+            self.assertEqual(rebuilt, stored)
+            self.assertIn("Current working directory: /var/tmp/", rebuilt)
+            self.assertIn("Status: clean", rebuilt)
+            self.assertNotIn("second commit", rebuilt)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_workspace_snapshot_reprobes_when_cwd_changes(self):
         import tempfile, shutil
         from pathlib import Path
@@ -191,7 +252,12 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         import tempfile, shutil, subprocess
         from pathlib import Path
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
-        from run_agent import AIAgent
+
+        # run_agent's import-time updater probes the installation's git admin dir;
+        # only session reset is exercised here, so bypass that unrelated startup path.
+        with patch.dict("sys.modules", {"hermes_bootstrap": SimpleNamespace()}), \
+             patch("hermes_cli._early_recovery.restore_interrupted_pull", return_value=False):
+            from run_agent import AIAgent
 
         tmp = Path(tempfile.mkdtemp(prefix="test-pinned-boundary-"))
         try:
@@ -279,7 +345,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
             with patch("agent.prompt_builder.load_soul_md", return_value=""), env(other), \
                  patch("agent.system_prompt.resolve_context_cwd", return_value=other):
                 moved = self._pin_agent(_cached_system_prompt=None, _session_db=db)
-                self.assertIn(f"- Root: {other}", build_system_prompt(moved))
+                self.assertIn(f"- Root: {other.resolve()}", build_system_prompt(moved))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -300,7 +366,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
                        return_value=f"Host: x\nUser home directory: /h\nCurrent working directory: {repo}"), \
                  patch("agent.system_prompt.resolve_context_cwd", return_value=repo):
                 resumed = self._pin_agent(_cached_system_prompt=None, _session_db=db)
-                self.assertIn(f"- Root: {repo}", build_system_prompt(resumed))
+                self.assertIn(f"- Root: {repo.resolve()}", build_system_prompt(resumed))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

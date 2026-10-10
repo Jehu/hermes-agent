@@ -335,10 +335,9 @@ class TestAgentCardV1:
 
 
 class TestV1Parts:
-    def test_text_part_has_no_kind(self):
+    def test_text_part_has_fasta2a_discriminator(self):
         part = protocol.text_part("Hello")
-        assert part == {"text": "Hello", "mediaType": "text/plain"}
-        assert "kind" not in part
+        assert part == {"kind": "text", "text": "Hello", "mimeType": "text/plain"}
 
     def test_text_message_roundtrip(self):
         msg = protocol.text_message(protocol.ROLE_USER, "hi there")
@@ -401,9 +400,9 @@ class TestV1Parts:
 class TestV1Task:
     def test_completed_task_shape(self):
         task = protocol.build_task("t1", "c1", protocol.STATE_COMPLETED, "the answer")
-        assert task["status"]["state"] == "TASK_STATE_COMPLETED"
-        assert task["artifacts"][0]["parts"][0] == {"text": "the answer", "mediaType": "text/plain"}
-        assert "kind" not in task
+        assert task["kind"] == "task"
+        assert task["status"]["state"] == "completed"
+        assert task["artifacts"][0]["parts"][0] == {"kind": "text", "text": "the answer", "mimeType": "text/plain"}
         # A2A v1.0 Task proto (lf.a2a.v1.Task) has no createdAt/lastModified.
         # Strict ProtoJSON parsers (a2a-sdk) reject unknown fields.
         assert "createdAt" not in task
@@ -411,7 +410,7 @@ class TestV1Task:
 
     def test_failed_task_has_message_no_artifacts(self):
         task = protocol.build_task("t2", "c2", protocol.STATE_FAILED, "went wrong")
-        assert task["status"]["state"] == "TASK_STATE_FAILED"
+        assert task["status"]["state"] == "failed"
         assert protocol.extract_text(task["status"]["message"]) == "went wrong"
         assert "artifacts" not in task
 
@@ -490,7 +489,7 @@ class TestClientTools:
         assert "search" in out
 
     def test_call_sends_v1_message(self, monkeypatch):
-        """Outbound params: contextId inside the message, v1.0 role, no kind."""
+        """Outbound params: contextId inside the message, FastA2A role and discriminators."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
@@ -513,10 +512,11 @@ class TestClientTools:
         msg = params["message"]
         assert "contextId" not in params  # v1.0: not top-level
         assert msg["contextId"]           # v1.0: inside the Message
-        assert msg["role"] == "ROLE_USER"
+        assert msg["role"] == "user"
+        assert msg["kind"] == "message"
         part = msg["parts"][0]
-        assert "kind" not in part
-        assert part["mediaType"] == "text/plain"
+        assert part["kind"] == "text"
+        assert part["mimeType"] == "text/plain"
         # Outbound redaction applied before sending.
         assert "sk-abcdefghij" not in part["text"]
 
@@ -535,7 +535,7 @@ class TestClientTools:
         out = tools.a2a_call({"agent": "r", "message": "review the code"})
         assert "Which repo?" in out
         assert "input-required" in out
-        assert "ctx-q" in out
+        assert "answer by calling a2a_call again with context_id 'ctx-q'" in out
 
     def test_rpc_url_prefers_supported_interfaces(self):
         card = {
@@ -731,7 +731,8 @@ class TestTaskRpcHandlers:
             adapter._turns.track("ctx-loopy")
         adapter.tasks.create("task-c", "ctx-loopy", "peer")
         resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-c"})
-        assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
+        assert resp["result"]["status"]["state"] == "canceled"
+        assert adapter.tasks.get("task-c")["state"] == protocol.STATE_CANCELED
         # Turn counter went back to zero: next track() is turn 1.
         assert adapter._turns.track("ctx-loopy") == 1
 
@@ -773,6 +774,16 @@ class TestTaskRpcHandlers:
         ids = {t["id"] for t in result["tasks"]} | {t["id"] for t in resp2["result"]["tasks"]}
         assert len(ids) == 4  # no overlap between pages
 
+    def test_tasks_list_accepts_lowercase_wire_state(self):
+        adapter = _bare_adapter()
+        adapter.tasks.create("done", "ctx-wire", "peer")
+        adapter.tasks.complete("done", protocol.STATE_COMPLETED, "saved reply")
+        adapter.tasks.create("pending", "ctx-wire", "peer")
+        for field in ("status", "state"):
+            result = adapter._rpc_tasks_list(1, {"contextId": "ctx-wire", field: "completed"})["result"]
+            assert result["totalSize"] == 1
+            assert [task["id"] for task in result["tasks"]] == ["done"]
+            assert result["tasks"][0]["status"]["state"] == "completed"
 
     def test_push_config_create_unknown_task(self):
         adapter = _bare_adapter()
@@ -936,7 +947,8 @@ class TestInboundRoundTrip:
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("hello agent"))
             assert resp["id"] == "1"
             task = resp["result"]
-            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert task["kind"] == "task"
+            assert task["status"]["state"] == "completed"
             reply = protocol.extract_text(task["artifacts"][0])
             assert "ECHO:" in reply
             assert "hello agent" in reply  # framed text still contains the task
@@ -946,7 +958,7 @@ class TestInboundRoundTrip:
                 "jsonrpc": "2.0", "id": "2", "method": "tasks/get",
                 "params": {"taskId": task["id"]},
             })
-            assert get_resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert get_resp["result"]["status"]["state"] == "completed"
             assert protocol.extract_text(get_resp["result"]["artifacts"][0]) == reply
 
             # 4) tasks/list sees it too
@@ -988,7 +1000,7 @@ class TestInboundRoundTrip:
                 "jsonrpc": "2.0", "id": "1", "method": "message/send",
                 "params": {"message": msg},
             })
-            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert resp["result"]["status"]["state"] == "completed"
             # The agent received all three parts rendered into text
             assert "Please process these:" in received["text"]
             assert "https://example.com/report.pdf" in received["text"]
@@ -1080,7 +1092,7 @@ class TestInboundRoundTrip:
             assert await adapter.connect() is True
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("review the code"))
             task = resp["result"]
-            assert task["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
+            assert task["status"]["state"] == "input-required"
             question = protocol.extract_text(task["status"]["message"])
             assert "Which repository" in question
             assert "[INPUT_REQUIRED]" not in question
@@ -1103,7 +1115,7 @@ class TestInboundRoundTrip:
             completed_before = protocol.metrics.tasks_completed
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("are you there"))
             task = resp["result"]
-            assert task["status"]["state"] == "TASK_STATE_FAILED"
+            assert task["status"]["state"] == "failed"
             assert protocol.metrics.tasks_failed == failed_before + 1
             assert protocol.metrics.tasks_completed == completed_before
             # The task store agrees.
@@ -1152,7 +1164,7 @@ class TestInboundRoundTrip:
             resp = await asyncio.to_thread(
                 _post_json, base + "/", _send_body("hello"),
                 {"Authorization": "Bearer topsecret"})
-            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert resp["result"]["status"]["state"] == "completed"
 
             await adapter.disconnect()
 
@@ -1181,7 +1193,7 @@ class TestInboundRoundTrip:
             body["params"]["peer"] = "the-operator"
             resp = await asyncio.to_thread(
                 _post_json, base + "/", body, {"Authorization": "Bearer tok-alice"})
-            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert resp["result"]["status"]["state"] == "completed"
             assert seen["user"] == "alice"
             assert "'alice'" in seen["text"]
             assert "the-operator" not in seen["text"]
@@ -1219,7 +1231,7 @@ class TestInboundRoundTrip:
                     _send_body("profile-scoped auth"),
                     {"Authorization": "Bearer secondary-token"},
                 )
-                assert response["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
+                assert response["result"]["status"]["state"] == "completed"
 
                 with pytest.raises(urllib.error.HTTPError) as exc_info:
                     await asyncio.to_thread(
@@ -1285,7 +1297,8 @@ class TestPushNotificationEndToEnd:
             })
             resp = await asyncio.to_thread(_post_json, base + "/", body)
             task = resp["result"]
-            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert task["kind"] == "task"
+            assert task["status"]["state"] == "completed"
 
             assert received_evt.wait(timeout=5), "push callback never received"
             payload = received["body"]
@@ -1293,7 +1306,7 @@ class TestPushNotificationEndToEnd:
             assert "statusUpdate" in payload
             su = payload["statusUpdate"]
             assert su["taskId"] == task["id"]
-            assert su["status"]["state"] == "TASK_STATE_COMPLETED"
+            assert su["status"]["state"] == "completed"
             assert "ECHO:" in protocol.extract_text(su["status"]["message"])
             # HMAC signature verifies against the shared secret.
             expected = hmac.new(
@@ -1384,7 +1397,8 @@ class TestMultiAgentRouting:
             agent=agent,
         )
         assert pending is None
-        assert terminal["status"]["state"] == protocol.STATE_COMPLETED
+        assert terminal["kind"] == "task"
+        assert terminal["status"]["state"] == "completed"
         assert protocol.extract_text(terminal["artifacts"][0]) == "dev reply"
         assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_COMPLETED
 
@@ -1447,9 +1461,9 @@ class TestV1SpecRegressionFixes:
             body["method"] = "SendMessage"
             resp = await asyncio.to_thread(_post_json, base + "/", body, {"A2A-Version": "1.0"})
             assert resp["id"] == "1"
-            assert set(resp["result"].keys()) == {"task"}
-            task = resp["result"]["task"]
-            assert task["status"]["state"] == protocol.STATE_COMPLETED
+            task = resp["result"]  # FastA2A 0.5 consumes a bare Task, not {"task": Task}.
+            assert task["kind"] == "task"
+            assert task["status"]["state"] == "completed"
             assert "hello v1" in protocol.extract_text(task["artifacts"][0])
             get_resp = await asyncio.to_thread(_post_json, base + "/", {
                 "jsonrpc": "2.0", "id": "2", "method": "GetTask",
@@ -1486,7 +1500,8 @@ class TestV1SpecRegressionFixes:
         reply, _ctx, state = tools._send_task(
             "dev", {"url": "http://peer.example", "auth": {}, "timeout": 5}, "hello", "ctx-1")
         assert reply == "ok"
-        assert state == protocol.STATE_COMPLETED
+        assert _ctx == "ctx-1"
+        assert state == "completed"
         assert posted["body"]["method"] == "SendMessage"
         assert posted["body"]["params"]["tenant"] == "dev-team"
 

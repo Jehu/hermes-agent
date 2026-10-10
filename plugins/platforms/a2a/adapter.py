@@ -749,8 +749,11 @@ class A2AAdapter(BasePlatformAdapter):
         offset = _to_int(params.get("pageToken") or 0, 0)
         page_size = _to_int(params.get("pageSize") or 50, 50)
         agent_slug, tenant = self._scope_for_agent(agent)
+        state = str(params.get("status") or params.get("state") or "")
+        if state and not state.startswith("TASK_STATE_"):
+            state = "TASK_STATE_" + state.replace("-", "_").upper()
         recs, next_offset, total = self.tasks.list(
-            context_id=str(params.get("contextId") or ""), state=str(params.get("status") or params.get("state") or ""),
+            context_id=str(params.get("contextId") or ""), state=state,
             page_size=page_size, offset=max(0, offset), agent_slug=agent_slug, tenant=tenant, with_total=True)
         include_artifacts = bool(params.get("includeArtifacts", False))
         return _ok(req_id, {"tasks": [protocol.TaskStore.to_task(r, include_artifacts=include_artifacts) for r in recs],
