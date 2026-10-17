@@ -11,7 +11,7 @@ from __future__ import annotations
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any
 
 from agent.memory_manager import MemoryManager, memory_session_context
 from agent.memory_provider import MemoryProvider
@@ -21,10 +21,10 @@ class _RecordingProvider(MemoryProvider):
     """Provider that records hook invocations with thread identity."""
 
     def __init__(self, end_delay: float = 0.0):
-        self.calls: List[tuple] = []
+        self.calls: list[tuple] = []
         self._end_delay = end_delay
-        self._caller_thread_ids: List[int] = []
-        self.switch_kwargs: List[Dict[str, Any]] = []
+        self._caller_thread_ids: list[int] = []
+        self.switch_kwargs: list[dict[str, Any]] = []
 
     # Required ABC surface (minimal no-ops)
     @property
@@ -34,7 +34,7 @@ class _RecordingProvider(MemoryProvider):
     def is_available(self) -> bool:
         return True
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         return []
 
     def initialize(self, agent: Any = None, **kwargs) -> bool:  # type: ignore[override]
@@ -46,7 +46,7 @@ class _RecordingProvider(MemoryProvider):
     def sync_turn(self, user_content: str, assistant_content: str, **kwargs) -> None:  # type: ignore[override]
         self.calls.append(("sync_turn", kwargs.get("session_id", "")))
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if self._end_delay:
             time.sleep(self._end_delay)
         self._caller_thread_ids.append(threading.get_ident())
