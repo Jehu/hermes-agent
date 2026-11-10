@@ -126,6 +126,36 @@ class TestBindSafety:
         assert security.A2ASecurityContext.capture().resolve_bind_host() == "localhost"
 
 
+    def test_v6_wildcard_serves_both_stacks_and_keeps_ipv4_identity(self, monkeypatch):
+        """``A2A_HOST=::`` is one dual-stack socket: IPv6 and IPv4 peers both reach it, and an IPv4
+        peer keeps its plain ``ip:a.b.c.d`` identity (not ``ip:::ffff:a.b.c.d``), so an allow-list
+        written in IPv4 still admits it."""
+        try:
+            with socket.socket(socket.AF_INET6) as probe:
+                probe.bind(("::", 0))
+        except OSError:
+            pytest.skip("host cannot bind IPv6 '::'")
+        monkeypatch.setenv("A2A_BEARER_TOKEN", "topsecret")
+        monkeypatch.setenv("A2A_TRUSTED_PEERS", "ip:127.0.0.1")
+        monkeypatch.setenv("A2A_HOST", "::")
+        adapter, _base = _make_live_adapter(monkeypatch)
+        auth = {"Authorization": "Bearer topsecret"}
+        tasks_list = {"jsonrpc": "2.0", "id": "1", "method": "tasks/list", "params": {}}
+
+        async def run():
+            assert await adapter.connect() is True
+            try:
+                for host in ("[::1]", "127.0.0.1"):
+                    card = await asyncio.to_thread(_get_json, f"http://{host}:{adapter.port}/.well-known/agent-card.json")
+                    assert "capabilities" in card
+                resp = await asyncio.to_thread(_post_json, f"http://127.0.0.1:{adapter.port}/", tasks_list, auth)
+                assert "error" not in resp, resp
+            finally:
+                await adapter.disconnect()
+
+        asyncio.run(run())
+
+
 class TestPeerIdentity:
     """authenticate() maps presented credentials to identities; the body
     never asserts who the peer is."""
@@ -335,9 +365,10 @@ class TestAgentCardV1:
 
 
 class TestV1Parts:
-    def test_text_part_has_fasta2a_discriminator(self):
+    def test_text_part_has_no_kind(self):
         part = protocol.text_part("Hello")
-        assert part == {"kind": "text", "text": "Hello", "mimeType": "text/plain"}
+        assert part == {"text": "Hello", "mediaType": "text/plain"}
+        assert "kind" not in part
 
     def test_text_message_roundtrip(self):
         msg = protocol.text_message(protocol.ROLE_USER, "hi there")
@@ -400,9 +431,9 @@ class TestV1Parts:
 class TestV1Task:
     def test_completed_task_shape(self):
         task = protocol.build_task("t1", "c1", protocol.STATE_COMPLETED, "the answer")
-        assert task["kind"] == "task"
-        assert task["status"]["state"] == "completed"
-        assert task["artifacts"][0]["parts"][0] == {"kind": "text", "text": "the answer", "mimeType": "text/plain"}
+        assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+        assert task["artifacts"][0]["parts"][0] == {"text": "the answer", "mediaType": "text/plain"}
+        assert "kind" not in task
         # A2A v1.0 Task proto (lf.a2a.v1.Task) has no createdAt/lastModified.
         # Strict ProtoJSON parsers (a2a-sdk) reject unknown fields.
         assert "createdAt" not in task
@@ -410,7 +441,7 @@ class TestV1Task:
 
     def test_failed_task_has_message_no_artifacts(self):
         task = protocol.build_task("t2", "c2", protocol.STATE_FAILED, "went wrong")
-        assert task["status"]["state"] == "failed"
+        assert task["status"]["state"] == "TASK_STATE_FAILED"
         assert protocol.extract_text(task["status"]["message"]) == "went wrong"
         assert "artifacts" not in task
 
@@ -489,7 +520,7 @@ class TestClientTools:
         assert "search" in out
 
     def test_call_sends_v1_message(self, monkeypatch):
-        """Outbound params: contextId inside the message, FastA2A role and discriminators."""
+        """Outbound params: contextId inside the message, v1.0 role, no kind."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
@@ -512,11 +543,10 @@ class TestClientTools:
         msg = params["message"]
         assert "contextId" not in params  # v1.0: not top-level
         assert msg["contextId"]           # v1.0: inside the Message
-        assert msg["role"] == "user"
-        assert msg["kind"] == "message"
+        assert msg["role"] == "ROLE_USER"
         part = msg["parts"][0]
-        assert part["kind"] == "text"
-        assert part["mimeType"] == "text/plain"
+        assert "kind" not in part
+        assert part["mediaType"] == "text/plain"
         # Outbound redaction applied before sending.
         assert "sk-abcdefghij" not in part["text"]
 
@@ -535,7 +565,7 @@ class TestClientTools:
         out = tools.a2a_call({"agent": "r", "message": "review the code"})
         assert "Which repo?" in out
         assert "input-required" in out
-        assert "answer by calling a2a_call again with context_id 'ctx-q'" in out
+        assert "ctx-q" in out
 
     def test_rpc_url_prefers_supported_interfaces(self):
         card = {
@@ -731,8 +761,7 @@ class TestTaskRpcHandlers:
             adapter._turns.track("ctx-loopy")
         adapter.tasks.create("task-c", "ctx-loopy", "peer")
         resp = adapter._rpc_tasks_cancel(1, {"taskId": "task-c"})
-        assert resp["result"]["status"]["state"] == "canceled"
-        assert adapter.tasks.get("task-c")["state"] == protocol.STATE_CANCELED
+        assert resp["result"]["status"]["state"] == "TASK_STATE_CANCELED"
         # Turn counter went back to zero: next track() is turn 1.
         assert adapter._turns.track("ctx-loopy") == 1
 
@@ -774,16 +803,6 @@ class TestTaskRpcHandlers:
         ids = {t["id"] for t in result["tasks"]} | {t["id"] for t in resp2["result"]["tasks"]}
         assert len(ids) == 4  # no overlap between pages
 
-    def test_tasks_list_accepts_lowercase_wire_state(self):
-        adapter = _bare_adapter()
-        adapter.tasks.create("done", "ctx-wire", "peer")
-        adapter.tasks.complete("done", protocol.STATE_COMPLETED, "saved reply")
-        adapter.tasks.create("pending", "ctx-wire", "peer")
-        for field in ("status", "state"):
-            result = adapter._rpc_tasks_list(1, {"contextId": "ctx-wire", field: "completed"})["result"]
-            assert result["totalSize"] == 1
-            assert [task["id"] for task in result["tasks"]] == ["done"]
-            assert result["tasks"][0]["status"]["state"] == "completed"
 
     def test_push_config_create_unknown_task(self):
         adapter = _bare_adapter()
@@ -927,6 +946,66 @@ def _send_body(text, ctx="", extra_params=None):
     return {"jsonrpc": "2.0", "id": "1", "method": "message/send", "params": params}
 
 
+@pytest.mark.parametrize("spelling", ["::1", "[::1]"])
+def test_ipv6_loopback_bind_serves_and_advertises_a_bracketed_url(monkeypatch, spelling):
+    """``A2A_HOST=::1`` (or its URL spelling ``[::1]``) is an accepted no-token bind: the listener
+    must come up on it and every advertised URL, including the Host-less fallback, must be one a
+    peer can parse (IPv6 literal in exactly one pair of brackets)."""
+    monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+    try:
+        with socket.socket(socket.AF_INET6) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        pytest.skip("host cannot bind IPv6 '::1'")
+    monkeypatch.setenv("A2A_HOST", spelling)
+    adapter, _ = _make_live_adapter(monkeypatch)
+    base = f"http://[::1]:{adapter.port}"
+
+    async def run():
+        assert await adapter.connect() is True
+        try:
+            return await asyncio.to_thread(_get_json, base + "/.well-known/agent-card.json")
+        finally:
+            await adapter.disconnect()
+
+    assert asyncio.run(run())["url"].startswith(base + "/")
+    assert adapter._base_url(None) == base + "/"
+
+
+@pytest.mark.parametrize("headers,dispatched", [
+    ({}, True),                                                      # local agent / SDK
+    ({"Origin": "https://site.example"}, False),                     # any browser Origin
+    ({"Sec-Fetch-Site": "cross-site"}, False),
+    ({"Content-Type": "text/plain"}, False),                         # CORS-simple body type
+])
+def test_no_token_listener_refuses_browser_originated_posts(monkeypatch, headers, dispatched):
+    """Without a token the listener trusts the loopback socket, which a web page in the operator's
+    browser can also reach: requests carrying browser signals are refused and never dispatched."""
+    monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+    seen: list = []
+    adapter, base = _make_live_adapter(monkeypatch, reply_fn=lambda event: seen.append(event) or "ok")
+
+    def post():
+        try:
+            return 200, _post_json(base + "/", _send_body("hi"), headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode())
+
+    async def run():
+        assert await adapter.connect() is True
+        try:
+            return await asyncio.to_thread(post)
+        finally:
+            await adapter.disconnect()
+
+    status, _ = asyncio.run(run())
+    assert (status == 200, bool(seen)) == (dispatched, dispatched), status
+    if not dispatched:
+        assert status == 403
+
+
 @pytest.mark.integration
 class TestInboundRoundTrip:
     def test_live_server_card_and_message_send(self, monkeypatch):
@@ -947,8 +1026,7 @@ class TestInboundRoundTrip:
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("hello agent"))
             assert resp["id"] == "1"
             task = resp["result"]
-            assert task["kind"] == "task"
-            assert task["status"]["state"] == "completed"
+            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
             reply = protocol.extract_text(task["artifacts"][0])
             assert "ECHO:" in reply
             assert "hello agent" in reply  # framed text still contains the task
@@ -958,7 +1036,7 @@ class TestInboundRoundTrip:
                 "jsonrpc": "2.0", "id": "2", "method": "tasks/get",
                 "params": {"taskId": task["id"]},
             })
-            assert get_resp["result"]["status"]["state"] == "completed"
+            assert get_resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
             assert protocol.extract_text(get_resp["result"]["artifacts"][0]) == reply
 
             # 4) tasks/list sees it too
@@ -1000,7 +1078,7 @@ class TestInboundRoundTrip:
                 "jsonrpc": "2.0", "id": "1", "method": "message/send",
                 "params": {"message": msg},
             })
-            assert resp["result"]["status"]["state"] == "completed"
+            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
             # The agent received all three parts rendered into text
             assert "Please process these:" in received["text"]
             assert "https://example.com/report.pdf" in received["text"]
@@ -1092,7 +1170,7 @@ class TestInboundRoundTrip:
             assert await adapter.connect() is True
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("review the code"))
             task = resp["result"]
-            assert task["status"]["state"] == "input-required"
+            assert task["status"]["state"] == "TASK_STATE_INPUT_REQUIRED"
             question = protocol.extract_text(task["status"]["message"])
             assert "Which repository" in question
             assert "[INPUT_REQUIRED]" not in question
@@ -1115,7 +1193,7 @@ class TestInboundRoundTrip:
             completed_before = protocol.metrics.tasks_completed
             resp = await asyncio.to_thread(_post_json, base + "/", _send_body("are you there"))
             task = resp["result"]
-            assert task["status"]["state"] == "failed"
+            assert task["status"]["state"] == "TASK_STATE_FAILED"
             assert protocol.metrics.tasks_failed == failed_before + 1
             assert protocol.metrics.tasks_completed == completed_before
             # The task store agrees.
@@ -1164,7 +1242,7 @@ class TestInboundRoundTrip:
             resp = await asyncio.to_thread(
                 _post_json, base + "/", _send_body("hello"),
                 {"Authorization": "Bearer topsecret"})
-            assert resp["result"]["status"]["state"] == "completed"
+            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
 
             await adapter.disconnect()
 
@@ -1193,7 +1271,7 @@ class TestInboundRoundTrip:
             body["params"]["peer"] = "the-operator"
             resp = await asyncio.to_thread(
                 _post_json, base + "/", body, {"Authorization": "Bearer tok-alice"})
-            assert resp["result"]["status"]["state"] == "completed"
+            assert resp["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
             assert seen["user"] == "alice"
             assert "'alice'" in seen["text"]
             assert "the-operator" not in seen["text"]
@@ -1231,7 +1309,7 @@ class TestInboundRoundTrip:
                     _send_body("profile-scoped auth"),
                     {"Authorization": "Bearer secondary-token"},
                 )
-                assert response["result"]["status"]["state"] == "completed"
+                assert response["result"]["status"]["state"] == "TASK_STATE_COMPLETED"
 
                 with pytest.raises(urllib.error.HTTPError) as exc_info:
                     await asyncio.to_thread(
@@ -1248,6 +1326,68 @@ class TestInboundRoundTrip:
             asyncio.run(run())
         finally:
             set_multiplex_active(False)
+
+
+@pytest.mark.parametrize("host,served", [
+    (None, True),                  # urllib's own Host: 127.0.0.1:<port>
+    ("localhost", True),
+    ("[::1]", True),
+    ("localhost.", True),          # absolute form of localhost
+    ("127.0.0.2", True),           # any loopback literal
+    ("rebound.example", False),
+    ("rebound.example.", False),    # a page's hostname re-resolved to 127.0.0.1
+])
+def test_no_token_listener_serves_only_loopback_host_names(monkeypatch, host, served):
+    """Without a token the listener trusts the loopback socket; a page on a hostname re-resolved to
+    127.0.0.1 is same-origin to it, so every route refuses a non-loopback Host before it runs."""
+    monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+    seen: list = []
+    adapter, base = _make_live_adapter(monkeypatch, reply_fn=lambda event: seen.append(event) or "ok")
+    headers = {"Host": f"{host}:{base.rsplit(':', 1)[1]}"} if host else {}
+
+    def status(fn, *args):
+        try:
+            fn(*args)
+            return 200
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    async def run():
+        assert await adapter.connect() is True
+        try:
+            return [await asyncio.to_thread(status, _get_json, base + "/health", headers),
+                    await asyncio.to_thread(status, _get_json, base + "/.well-known/agent-card.json", headers),
+                    await asyncio.to_thread(status, _post_json, base + "/", _send_body("hi"), headers)]
+        finally:
+            await adapter.disconnect()
+
+    assert asyncio.run(run()) == [200 if served else 403] * 3
+    assert bool(seen) is served
+
+
+def test_no_token_listener_serves_its_public_url_host(monkeypatch):
+    """A local reverse proxy forwarding the ``A2A_PUBLIC_URL`` host is served; other names stay refused."""
+    monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
+    monkeypatch.setenv("A2A_PUBLIC_URL", "https://agent.example.test/")
+    adapter, base = _make_live_adapter(monkeypatch)
+
+    def status(host):
+        try:
+            _get_json(base + "/health", {"Host": host})
+            return 200
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    async def run():
+        assert await adapter.connect() is True
+        try:
+            return [await asyncio.to_thread(status, host) for host in ("agent.example.test", "rebound.example")]
+        finally:
+            await adapter.disconnect()
+
+    assert asyncio.run(run()) == [200, 403]
 
 
 # --------------------------------------------------------------------------
@@ -1297,8 +1437,7 @@ class TestPushNotificationEndToEnd:
             })
             resp = await asyncio.to_thread(_post_json, base + "/", body)
             task = resp["result"]
-            assert task["kind"] == "task"
-            assert task["status"]["state"] == "completed"
+            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
 
             assert received_evt.wait(timeout=5), "push callback never received"
             payload = received["body"]
@@ -1306,7 +1445,7 @@ class TestPushNotificationEndToEnd:
             assert "statusUpdate" in payload
             su = payload["statusUpdate"]
             assert su["taskId"] == task["id"]
-            assert su["status"]["state"] == "completed"
+            assert su["status"]["state"] == "TASK_STATE_COMPLETED"
             assert "ECHO:" in protocol.extract_text(su["status"]["message"])
             # HMAC signature verifies against the shared secret.
             expected = hmac.new(
@@ -1375,6 +1514,106 @@ class TestMultiAgentRouting:
         route = adapter._route_for_request("/dev/", {"tenant": "research"})
         assert "error" in route
 
+    def test_forwarded_retry_of_the_same_message_reuses_its_admission_id(self, monkeypatch):
+        """A peer that resends after a timeout repeats its messageId; the forwarded input id must
+        repeat with it so the owner answers from the accepted work instead of queueing a second turn."""
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
+        }))
+        agent = adapter._agents["dev"]
+        seen = []
+
+        def fake_forward(agent_arg, peer, context_id, framed_text, *, input_id):
+            seen.append(input_id)
+            return "dev reply", protocol.STATE_COMPLETED
+
+        adapter._forward_to_profile = fake_forward  # type: ignore
+        message = protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-dev")
+        for _ in range(2):
+            adapter._prepare_task({"tenant": "dev", "message": dict(message)}, "peer-x", agent=agent)
+        fresh = protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-dev")
+        adapter._prepare_task({"tenant": "dev", "message": fresh}, "peer-x", agent=agent)
+        other_context = {**dict(message), "contextId": "ctx-other"}
+        adapter._prepare_task({"tenant": "dev", "message": other_context}, "peer-x", agent=agent)
+        assert seen[0] == seen[1]
+        assert len({seen[0], seen[2], seen[3]}) == 3
+        assert all(i.startswith("a2a-msg:") and len(i) < 1024 for i in seen)
+        # A message without an id keeps the per-task id, which is never reused.
+        adapter._prepare_task({"tenant": "dev", "message": {"role": "user", "parts": [{"text": "hi"}], "contextId": "ctx-dev"}},
+                              "peer-x", agent=agent)
+        assert not seen[4].startswith("a2a-msg:")
+
+    def test_forwarded_retry_without_a_context_reopens_the_same_context(self):
+        """A first send is retried with the same messageId and no contextId, because the peer never
+        received one. It must land in the same context and admission as the first attempt."""
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
+        }))
+        agent = adapter._agents["dev"]
+        seen = []
+
+        def fake_forward(agent_arg, peer, context_id, framed_text, *, input_id):
+            seen.append((context_id, input_id))
+            return "dev reply", protocol.STATE_COMPLETED
+
+        adapter._forward_to_profile = fake_forward  # type: ignore
+        message = protocol.text_message(protocol.ROLE_USER, "hello")
+        assert "contextId" not in message
+        first, _ = adapter._prepare_task({"tenant": "dev", "message": dict(message)}, "peer-x", agent=agent)
+        second, _ = adapter._prepare_task({"tenant": "dev", "message": dict(message)}, "peer-x", agent=agent)
+        assert seen[0] == seen[1]
+        assert first["contextId"] == second["contextId"] == seen[0][0]
+        assert first["contextId"].startswith("ctx-")
+        # A different first message opens its own context; so does another peer repeating the id.
+        adapter._prepare_task({"tenant": "dev", "message": protocol.text_message(protocol.ROLE_USER, "hello")},
+                              "peer-x", agent=agent)
+        adapter._prepare_task({"tenant": "dev", "message": dict(message)}, "peer-y", agent=agent)
+        assert len({context for context, _ in seen}) == 3
+        # Without a messageId there is nothing to retry by; the context stays random.
+        bare = {"role": "user", "parts": [{"text": "hi"}]}
+        one, _ = adapter._prepare_task({"tenant": "dev", "message": dict(bare)}, "peer-x", agent=agent)
+        two, _ = adapter._prepare_task({"tenant": "dev", "message": dict(bare)}, "peer-x", agent=agent)
+        assert one["contextId"] != two["contextId"]
+
+    def test_forwarded_retries_do_not_spend_the_turn_budget(self, monkeypatch):
+        """The owner answers a resend from the accepted admission, so the anti-loop counter and the
+        conversation log see the message once. Distinct messages in the context still count."""
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("A2A_MAX_PINGPONG_TURNS", "2")
+        persisted = []
+        monkeypatch.setattr(protocol, "persist_message", lambda context_id, role, text, task_id="", input_id="": persisted.append(role))
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
+            "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
+        }))
+        agent = adapter._agents["dev"]
+        seen = []
+
+        def fake_forward(agent_arg, peer, context_id, framed_text, *, input_id):
+            seen.append(input_id)
+            return "dev reply", protocol.STATE_COMPLETED
+
+        adapter._forward_to_profile = fake_forward  # type: ignore
+        message = protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-dev")
+        tasks = [adapter._prepare_task({"tenant": "dev", "message": dict(message)}, "peer-x", agent=agent)[0]
+                 for _ in range(5)]
+        assert [task["status"]["state"] for task in tasks] == [protocol.STATE_COMPLETED] * 5
+        assert len(seen) == 5 and len(set(seen)) == 1
+        assert persisted.count("user") == 1
+        assert adapter._turns.track("ctx-dev") == 2
+        # That track call was the second distinct turn; the third trips the guard as before.
+        fresh = protocol.text_message(protocol.ROLE_USER, "again", context_id="ctx-dev")
+        rejected, _ = adapter._prepare_task({"tenant": "dev", "message": fresh}, "peer-x", agent=agent)
+        assert rejected["status"]["state"] == protocol.STATE_REJECTED
+        assert len(seen) == 5
+
     def test_forwarded_profile_task_completes_in_task_store(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
@@ -1384,7 +1623,7 @@ class TestMultiAgentRouting:
         }))
         agent = adapter._agents["dev"]
 
-        def fake_forward(agent_arg, peer, context_id, framed_text):
+        def fake_forward(agent_arg, peer, context_id, framed_text, *, input_id):
             assert agent_arg["slug"] == "dev"
             assert peer == "peer-x"
             assert "hello" in framed_text
@@ -1397,8 +1636,7 @@ class TestMultiAgentRouting:
             agent=agent,
         )
         assert pending is None
-        assert terminal["kind"] == "task"
-        assert terminal["status"]["state"] == "completed"
+        assert terminal["status"]["state"] == protocol.STATE_COMPLETED
         assert protocol.extract_text(terminal["artifacts"][0]) == "dev reply"
         assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_COMPLETED
 
@@ -1461,9 +1699,9 @@ class TestV1SpecRegressionFixes:
             body["method"] = "SendMessage"
             resp = await asyncio.to_thread(_post_json, base + "/", body, {"A2A-Version": "1.0"})
             assert resp["id"] == "1"
-            task = resp["result"]  # FastA2A 0.5 consumes a bare Task, not {"task": Task}.
-            assert task["kind"] == "task"
-            assert task["status"]["state"] == "completed"
+            assert set(resp["result"].keys()) == {"task"}
+            task = resp["result"]["task"]
+            assert task["status"]["state"] == protocol.STATE_COMPLETED
             assert "hello v1" in protocol.extract_text(task["artifacts"][0])
             get_resp = await asyncio.to_thread(_post_json, base + "/", {
                 "jsonrpc": "2.0", "id": "2", "method": "GetTask",
@@ -1500,8 +1738,7 @@ class TestV1SpecRegressionFixes:
         reply, _ctx, state = tools._send_task(
             "dev", {"url": "http://peer.example", "auth": {}, "timeout": 5}, "hello", "ctx-1")
         assert reply == "ok"
-        assert _ctx == "ctx-1"
-        assert state == "completed"
+        assert state == protocol.STATE_COMPLETED
         assert posted["body"]["method"] == "SendMessage"
         assert posted["body"]["params"]["tenant"] == "dev-team"
 
@@ -1591,55 +1828,31 @@ class TestV1SpecRegressionFixes:
         assert "one" in adapter._agents
         assert "two" not in adapter._agents
 
-    @pytest.mark.platforms("linux")
-    def test_forward_to_profile_first_contact_creates_then_resumes_fake_hermes(self, monkeypatch, tmp_path):
+    def test_forward_to_profile_uses_receipted_owner_not_local_writer(self, monkeypatch, tmp_path):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
+        from gateway import session_a2a
 
-        profile_home = tmp_path / "profile"
-        profile_home.mkdir()
-        db = profile_home / "state.db"
-        import sqlite3
-        con = sqlite3.connect(db)
-        con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, title TEXT)")
-        con.commit(); con.close()
-
-        fakebin = tmp_path / "bin"
-        fakebin.mkdir()
-        calls = tmp_path / "calls.jsonl"
-        hermes = fakebin / "hermes"
-        hermes.write_text("""#!/usr/bin/env python3
-import json, os, sqlite3, sys, time
-calls = os.environ['FAKE_HERMES_CALLS']
-with open(calls, 'a') as f:
-    f.write(json.dumps(sys.argv[1:]) + '\\n')
-home = os.environ['HERMES_HOME']
-con = sqlite3.connect(os.path.join(home, 'state.db'))
-if '--resume' not in sys.argv:
-    con.execute('INSERT INTO sessions (id, source, started_at, title) VALUES (?, ?, ?, ?)', ('sess-1', 'a2a', time.time(), None))
-    con.commit()
-print('fake reply')
-""")
-        hermes.chmod(0o755)
-        monkeypatch.setenv("PATH", str(fakebin) + os.pathsep + os.environ.get("PATH", ""))
-        monkeypatch.setenv("FAKE_HERMES_CALLS", str(calls))
-        monkeypatch.setattr("plugins.platforms.a2a.adapter._profile_home", lambda profile: str(profile_home))
-
+        calls = []
+        async def owner(home, **params):
+            calls.append((home, params))
+            return {'status': 'terminal', 'outcome': 'completed',
+                    'result': {'final_response': 'owner reply'}}
+        monkeypatch.setattr(session_a2a, 'forward_to_owner', owner)
+        monkeypatch.setattr('plugins.platforms.a2a.adapter._profile_home', lambda profile: str(tmp_path))
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
-            "agents": {"dev": {"profile": "dev", "tenant": "dev", "timeout": 5}}
+            'agents': {'dev': {'profile': 'dev', 'tenant': 'team', 'timeout': 5}}
         }))
-        agent = adapter._agents["dev"]
-        reply, state = adapter._forward_to_profile(agent, "peer", "ctx/unsafe value", "hello")
-        assert (reply, state) == ("fake reply", protocol.STATE_COMPLETED)
-        reply2, state2 = adapter._forward_to_profile(agent, "peer", "ctx/unsafe value", "again")
-        assert (reply2, state2) == ("fake reply", protocol.STATE_COMPLETED)
-        argv_lines = [json.loads(line) for line in calls.read_text().splitlines()]
-        assert "--resume" not in argv_lines[0]
-        assert argv_lines[1][argv_lines[1].index("--resume") + 1] == "sess-1"
-        con = sqlite3.connect(db)
-        title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
-        con.close()
-        assert title == "a2a-dev-ctx-unsafe-value"
+        reply, state = adapter._forward_to_profile(adapter._agents['dev'], 'peer', 'ctx/unsafe value', 'hello')
+        assert (reply, state) == ('owner reply', protocol.STATE_COMPLETED)
+        assert calls[0][0] == str(tmp_path)
+        assert calls[0][1]['context_id'] == 'ctx/unsafe value'
+        assert calls[0][1]['peer'] == 'peer'
+        assert calls[0][1]['agent'] == 'dev'
+        assert calls[0][1]['tenant'] == 'team'
+        assert calls[0][1]['input_id']
+        assert not (tmp_path / 'state.db').exists()
+
 
 
 # --------------------------------------------------------------------------

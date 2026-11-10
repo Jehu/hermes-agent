@@ -1,6 +1,7 @@
 import os
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cli import HermesCLI
 
@@ -242,50 +243,62 @@ class TestResumeFlushesBeforeEndSession:
         cli_obj._session_db.end_session.assert_called_once()
 
 
-def test_session_switch_clears_title_hint_without_memory_manager():
-    from hermes_cli.cli_commands_mixin import _sync_agent_to_session
+class TestResumeOpensTheTargetOnTheGateway:
+    """/resume on the gateway session store: one ``session.resume`` of the target classifies it before
+    anything changes. A real store, so the switch takes its gateway path (a ``MagicMock`` store is not
+    a ``GatewaySessionStore`` and skips it); the gateway double admits or refuses ``session.resume``."""
 
-    session_db = SimpleNamespace(
-        get_session_title=lambda _sid: None,
-        get_session_title_source=lambda _sid: None,
-    )
-    agent = SimpleNamespace(
-        session_id="old-session",
-        session_cwd="/old/project",
-        _session_db=session_db,
-        _memory_manager=None,
-        _session_title_hint="Old title",
-        _session_title_source="user",
-        reset_session_state=lambda: None,
-    )
-    cli_obj = SimpleNamespace(agent=agent, conversation_history=[])
+    def _switch(self, refusal=None):
+        from hermes_cli.gateway_client import GatewayRPCError
+        from hermes_cli.gateway_connection import GatewayConnection
+        from hermes_cli.gateway_session_store import GatewaySessionStore
 
-    _sync_agent_to_session(
-        cli_obj,
-        "new-session",
-        parent_session_id="old-session",
-        reason="resume",
-        session_cwd=None,
-    )
+        calls = []
 
-    assert agent.session_id == "new-session"
-    assert agent.session_cwd is None
-    assert agent._session_title_hint is None
-    assert agent._session_title_source is None
+        def gateway(method, **params):
+            calls.append((method, params))
+            if method == "session.resume" and params["session_id"] == "target" and refusal:
+                raise GatewayRPCError(refusal)
+            if method == "session.resume":
+                sid = params["session_id"]
+                return {"stored_session_id": sid, "subscription_id": f"sub-{sid}", "info": {}}
+            return {}
 
+        conn = GatewayConnection()
+        conn.start = lambda *_a, **_k: None
+        store = GatewaySessionStore(conn)
+        store.call = gateway
+        store._reader = MagicMock()
+        store._reader.get_session.return_value = {"id": "target", "title": "T"}
+        store._reader.resolve_resume_session_id.return_value = "target"
+        store._reader.get_resume_conversations.return_value = ([], [])
+        store.attach("current_session")
+        calls.clear()
+        cli_obj = _make_cli()
+        cli_obj._session_db = store
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="target"),
+            patch("cli._cprint") as mock_cprint,
+        ):
+            cli_obj._handle_resume_command("/resume target")
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        return cli_obj, conn, calls, printed
 
-def test_live_title_rename_refreshes_agent_title_context():
-    cli_obj = _make_cli()
-    cli_obj._status_bar_title_checked_at = 1.0
-    cli_obj.agent = SimpleNamespace(
-        _session_title_hint="Old title",
-        _session_title_source="llm",
-    )
-    cli_obj._session_db.get_session.return_value = {"id": cli_obj.session_id}
-    cli_obj._session_db.set_session_title.return_value = True
+    def test_an_openable_target_is_subscribed_and_the_old_session_detached(self):
+        cli_obj, conn, calls, _ = self._switch()
 
-    with patch("cli._cprint"):
-        cli_obj._cmd_title("/title New title")
+        assert cli_obj.session_id == "target"
+        assert conn.states["target"].subscription_id == "sub-target"
+        assert [method for method, _ in calls] == ["session.resume", "session.detach"]
+        assert conn.states["current_session"].subscription_id is None
 
-    from tools.bot_mode_dm import _session_title
-    assert _session_title(cli_obj.agent) == "New title"
+    @pytest.mark.parametrize("refusal", ["not_found", "permission_denied", "profile_mismatch"])
+    def test_a_refused_target_keeps_the_current_session(self, refusal):
+        from agent.i18n import t
+
+        cli_obj, conn, calls, printed = self._switch(refusal)
+
+        assert cli_obj.session_id == "current_session"
+        assert conn.states["current_session"].subscription_id == "sub-current_session"
+        assert calls == [("session.resume", {"session_id": "target"})]  # asked once, nothing detached
+        assert t("gateway.resume.switch_failed") in printed and refusal in printed

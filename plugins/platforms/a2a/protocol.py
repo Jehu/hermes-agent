@@ -5,6 +5,7 @@ Stdlib only. ``extract_text`` stays tolerant of v0.3 peers."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -27,22 +28,6 @@ STATE_COMPLETED, STATE_FAILED = "TASK_STATE_COMPLETED", "TASK_STATE_FAILED"
 STATE_CANCELED, STATE_REJECTED = "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"
 TERMINAL_STATES = frozenset({STATE_COMPLETED, STATE_FAILED, STATE_CANCELED, STATE_REJECTED})
 ROLE_USER, ROLE_AGENT = "ROLE_USER", "ROLE_AGENT"
-
-
-def wire_state(state: str) -> str:
-    """Normalize Hermes task states for strict v0.3-style A2A clients."""
-    value = (state or "").strip()
-    if value.startswith("TASK_STATE_"):
-        value = value[len("TASK_STATE_"):]
-    return value.replace("_", "-").lower()
-
-
-def wire_role(role: str) -> str:
-    """Normalize Hermes message roles for strict v0.3-style A2A clients."""
-    value = (role or "").strip()
-    if value.startswith("ROLE_"):
-        value = value[len("ROLE_"):]
-    return value.lower()
 
 # A reply starting with this marker is a clarification request -> TASK_STATE_INPUT_REQUIRED (marker stripped).
 INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
@@ -114,8 +99,10 @@ def jsonrpc_error(req_id: Any, code: int, message: str) -> dict:
 
 
 def send_message_response(payload: dict) -> dict:
-    """Return the bare Task or Message required by FastA2A 0.5's JSON-RPC result."""
-    return payload
+    """v1.0 SendMessageResponse oneof: exactly one of ``task`` / ``message``."""
+    if isinstance(payload, dict) and payload.get("status") and payload.get("id"):
+        return {"task": payload}
+    return {"message": payload}
 
 
 def unwrap_send_message_response(result: Any) -> Any:
@@ -141,14 +128,20 @@ def new_context_id() -> str:
     return "ctx-" + uuid.uuid4().hex[:16]
 
 
+def message_context_id(scope: str, message_id: str) -> str:
+    """The context a first message without a ``contextId`` opens. Named by the message, so a retry
+    of that send after a timeout reopens the same context instead of a fresh one."""
+    return "ctx-" + hashlib.sha256(f"{scope}\0{message_id}".encode()).hexdigest()[:16]
+
+
 def text_part(text: str) -> dict:
-    """Text Part compatible with strict FastA2A discriminated unions."""
-    return {"kind": "text", "text": text, "mimeType": "text/plain"}
+    """v1.0 text Part (member-presence discriminated, no ``kind``)."""
+    return {"text": text, "mediaType": "text/plain"}
 
 
 def text_message(role: str, text: str, context_id: str = "") -> dict:
     """A2A v1.0 Message with a single text Part."""
-    msg: dict[str, Any] = {"kind": "message", "role": wire_role(role), "parts": [text_part(text)], "messageId": uuid.uuid4().hex}
+    msg: dict[str, Any] = {"role": role, "parts": [text_part(text)], "messageId": uuid.uuid4().hex}
     if context_id:
         msg["contextId"] = context_id
     return msg
@@ -190,6 +183,12 @@ def extract_text(message_or_params: dict) -> str:
     return "\n".join(chunks).strip()
 
 
+def extract_message_id(params: dict) -> str:
+    """v1.0 puts messageId inside the Message; a peer retrying a send repeats it."""
+    msg = params.get("message") or {}
+    return str(msg.get("messageId") or "") if isinstance(msg, dict) else ""
+
+
 def extract_context_id(params: dict) -> str:
     """v1.0 puts contextId inside the Message; tolerate legacy top-level."""
     msg = params.get("message") or {}
@@ -199,7 +198,7 @@ def extract_context_id(params: dict) -> str:
 def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
     createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
-    task: dict[str, Any] = {"kind": "task", "id": task_id, "contextId": context_id, "status": {"state": wire_state(state), "timestamp": now_iso()}}
+    task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": now_iso()}}
     if agent_text:
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
@@ -209,7 +208,7 @@ def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", 
 
 def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
     """v1.0 StreamResponse with a statusUpdate member."""
-    status: dict[str, Any] = {"state": wire_state(state), "timestamp": now_iso()}
+    status: dict[str, Any] = {"state": state, "timestamp": now_iso()}
     if text:
         status["message"] = text_message(ROLE_AGENT, text, context_id)
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
@@ -335,9 +334,11 @@ class TaskStore:
         return {"configId": rec.get("push_config_id") or "", "taskId": rec["task_id"],
                 "createdAt": rec.get("created_iso", ""), "pushNotificationConfig": {"url": rec.get("push_url") or ""}}
 
-    def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "") -> dict:
+    def create(self, task_id: str, context_id: str, peer: str, agent_slug: str = "", tenant: str = "",
+               input_id: str = "") -> dict:
+        """``input_id``: the owner admission a forwarded task was sent as (empty for local tasks)."""
         rec = {"task_id": task_id, "context_id": context_id, "peer": peer, "agent_slug": agent_slug or "", "tenant": tenant or "",
-               "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
+               "input_id": input_id, "state": STATE_SUBMITTED, "reply": "", "created_at": time.time(), "created_iso": now_iso(), "push_url": "", "push_config_id": ""}
         with self._lock:
             self._tasks[task_id] = rec
         return dict(rec)
@@ -449,15 +450,22 @@ def _conv_path(context_id: str) -> Path:
     return get_hermes_home() / "a2a_conversations" / f"{safe}.jsonl"
 
 
-def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
+def persist_message(context_id: str, role: str, text: str, task_id: str = "", input_id: str = "") -> None:
     """Append one message to the context's on-disk conversation log. Never raises."""
     try:
         path = _conv_path(context_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"ts": time.time(), "role": role, "text": text, "task_id": task_id, **({"input_id": input_id} if input_id else {})}
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"ts": time.time(), "role": role, "text": text, "task_id": task_id}, ensure_ascii=False) + "\n")
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+def logged_input(context_id: str, input_id: str) -> bool:
+    """True when the context's durable log already holds the forwarded input ``input_id``."""
+    # limit=0 slices out[-0:], i.e. every entry.
+    return any(entry.get("input_id") == input_id for entry in load_conversation(context_id, limit=0))
 
 
 def load_conversation(context_id: str, limit: int = 50) -> list[dict]:

@@ -110,14 +110,13 @@ class TestStreamResponseFormat:
         su = ev["statusUpdate"]
         assert su["taskId"] == "task-1"
         assert su["contextId"] == "ctx-1"
-        assert su["status"]["state"] == "working"
+        assert su["status"]["state"] == "TASK_STATE_WORKING"
         assert "kind" not in su and "final" not in su
 
     def test_status_update_with_message(self):
         ev = protocol.status_update("t", "c", protocol.STATE_INPUT_REQUIRED, "which one?")
         msg = ev["statusUpdate"]["status"]["message"]
-        assert msg["kind"] == "message"
-        assert msg["role"] == "agent"
+        assert msg["role"] == "ROLE_AGENT"
         assert protocol.extract_text(msg) == "which one?"
 
     def test_artifact_update_shape(self):
@@ -126,7 +125,7 @@ class TestStreamResponseFormat:
         au = ev["artifactUpdate"]
         assert au["taskId"] == "task-1"
         part = au["artifact"]["parts"][0]
-        assert part == {"kind": "text", "text": "the result", "mimeType": "text/plain"}
+        assert part == {"text": "the result", "mediaType": "text/plain"}
         assert "kind" not in au and "final" not in au
 
     def test_sse_data_framing(self):
@@ -181,15 +180,15 @@ class TestStreamingEndToEnd:
             # followed by status/artifact updates until terminal closure.
             for p in payloads:
                 assert set(p.keys()) <= {"task", "message", "statusUpdate", "artifactUpdate"}
+                assert "kind" not in json.dumps(p)
             assert "task" in payloads[0]
-            assert payloads[0]["task"]["kind"] == "task"
-            assert payloads[0]["task"]["status"]["state"] == "submitted"
+            assert payloads[0]["task"]["status"]["state"] == "TASK_STATE_SUBMITTED"
 
             states = [p["statusUpdate"]["status"]["state"]
                       for p in payloads if "statusUpdate" in p]
-            assert states[0] == "working"
-            assert "working" in states
-            assert states[-1] == "completed"
+            assert states[0] == "TASK_STATE_WORKING"
+            assert "TASK_STATE_WORKING" in states
+            assert states[-1] == "TASK_STATE_COMPLETED"
             # No v0.3 'final' flag anywhere; closure is the terminal signal.
             assert all("final" not in p.get("statusUpdate", {}) for p in payloads)
 
@@ -218,7 +217,7 @@ class TestStreamingEndToEnd:
             })
             states = [p["statusUpdate"]["status"]["state"]
                       for p in payloads if "statusUpdate" in p]
-            assert "completed" in states
+            assert "TASK_STATE_COMPLETED" in states
             artifacts = [p for p in payloads if "artifactUpdate" in p]
             assert artifacts and "ECHO:" in protocol.extract_text(
                 artifacts[0]["artifactUpdate"]["artifact"])
@@ -320,7 +319,9 @@ class TestAntiLoopProtection:
                 resp = await asyncio.to_thread(
                     _post_json, base + "/", _send_body("ping", ctx="ctx-pingpong"))
                 states.append(resp["result"]["status"]["state"])
-            assert states == ["completed", "completed", "rejected"]
+            assert states[0] == "TASK_STATE_COMPLETED"
+            assert states[1] == "TASK_STATE_COMPLETED"
+            assert states[2] == "TASK_STATE_REJECTED"
             await adapter.disconnect()
 
         asyncio.run(run())
@@ -474,7 +475,7 @@ class TestTaskStore:
         adapter._add_pending("t-live", "c1")
         agent = {"slug": "dev", "tenant": "dev", "profile": "dev", "local": False, "timeout": 900}
 
-        def fake_forward(*_args):
+        def fake_forward(*_args, **_kwargs):
             forwarded_id = next(tid for tid in adapter.tasks._tasks if tid not in {
                 "t-live", "t-orphan", "t-within-reply-window"
             })
